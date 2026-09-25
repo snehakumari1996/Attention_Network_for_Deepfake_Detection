@@ -1,130 +1,56 @@
 # Attention Network for DeepFake Detection
 
-A deepfake detector built for cross-dataset generalisation rather than in-domain accuracy. An Xception-based encoder–decoder produces both a classification embedding and a reconstruction of the input; the reconstruction residual then guides spatial attention, while a learnable Fourier-domain filter emphasises the spectral bands that carry forgery evidence.
+Reconstruction-classification learning with a learnable spectral filter, for face forgery detection that generalizes across datasets.
 
-M.Tech thesis, Delhi Technological University, 2022–2024. Trained on FaceForensics++.
+M.Tech thesis, Delhi Technological University, 2022 to 2024. Implemented in PyTorch.
 
-### Relation to RECCE
+## Introduction
 
-The reconstruction–classification backbone follows [RECCE](https://openaccess.thecvf.com/content/CVPR2022/html/Cao_End-to-End_Reconstruction-Classification_Learning_for_Face_Forgery_Detection_CVPR_2022_paper.html) (Cao et al., CVPR 2022): the same Xception encoder, the same reconstruction decoder, and the same principle that reconstruction error localises manipulation.
+Face forgery detectors tend to learn artifacts specific to the manipulations in their training set. They score well in domain and transfer poorly to unseen generators, which is the failure that matters for deployment. This repository contains a detector built to be evaluated cross-dataset from the start.
 
-Two changes:
+The architecture follows the reconstruction-classification framework of RECCE [1]. An Xception encoder produces a latent embedding, a decoder reconstructs the input face from it, and the per-pixel reconstruction residual is used to gate attention: regions the model reconstructs poorly are regions inconsistent with its representation of authentic faces.
 
-- **RECCE's multi-scale graph reasoning module is removed.**
-- **A learnable Fourier-domain filter branch is added**, taking the encoder features into frequency space, applying a learned per-bin mask, and returning to the spatial domain before fusion.
-
-The intent was to replace graph-based spatial reasoning with spectral evidence, on the view that the resampling and blending traces deepfake pipelines leave are more directly visible in frequency space than in relational structure over spatial nodes.
-
-This work led to a follow-on paper on deeper CLIP adaptation for deepfake detection, which reaches 0.949 average video-level AUROC across seven benchmarks. <!-- Once the preprint is live: See [Beyond Minimal Tuning](ARXIV_LINK). -->
-
----
-
-## The problem this targets
-
-Most deepfake detectors key on spatial RGB cues, or specialise for a particular condition such as heavy compression or low light. Both choices tend to fit the training manipulation rather than forgery in general, so in-domain accuracy looks excellent and cross-dataset accuracy collapses. That gap is what makes a detector unusable in practice, and it is the metric this project optimises for.
-
-Two mechanisms address it here: reconstruction-guided attention, inherited from RECCE, and a learnable frequency filter, which is this project's addition.
-
-## Why a frequency branch
-
-Deepfake pipelines nearly all involve face alignment (warping), resizing, and affine transforms during blending. Interpolation kernels and repeated resampling leave structured irregularities in frequency space: energy bumps, ringing, aliasing patterns. Generative upsampling also distorts the spectral energy distribution, so a generated face often deviates from the roughly 1/f falloff that natural images follow, either by being too smooth or by carrying abnormal mid- and high-frequency energy. Blending boundaries at the jawline, hairline and cheeks inject extra high-frequency content at the seams.
-
-These traces are subtle in RGB but structured in the spectrum, which is why a frequency branch adds something a spatial-only encoder misses.
-
-The filter is **learned, not fixed**. A hand-designed high-pass filter commits in advance to which bands matter. Here the network decides, emphasising discriminative bands and suppressing brittle noisy ones.
-
-## Why reconstruction-guided attention
-
-The decoder reconstructs the input face from the encoder embedding. Where the model reconstructs poorly, something about the region is inconsistent with what the encoder learned to represent — which is exactly where manipulation artifacts tend to live.
-
-So rather than letting attention learn where to look from scratch, the per-pixel reconstruction residual `|x − x̂|` is used to produce the attention map. Forgery evidence is not spread evenly across a face, and the residual gives the network a direct, unlearned signal about where to concentrate.
-
-## Architecture
-
-### Overall flow
-
-```
-input ──► encoder blocks 1–4 ──► embedding ──┬──► decoder 1–6 ──► reconstruction x̂
-                                             │
-                                             └──► encoder blocks 5–7 ──► Fourier filter ──► freq
-                                                        │                                    │
-                                                        └────► cross-modal attention ◄───────┘
-                                                                        │
-                                                                   + embedding  (residual)
-                                                                        │
-                                                            encoder block 8
-                                                                        │
-                            guided attention ◄── |x − x̂| ───────────────┘
-                                                                        │
-                                                  encoder blocks 9–12 ──► 1024
-                                                     conv3 ──► 1536 ──► conv4 ──► 2048
-                                                     global average pool ──► dropout ──► FC
-```
-
-### Encoder
-
-Xception-style: depthwise separable convolutions with residual connections, batch norm throughout. Channel progression 3 → 32 → 64 → 128 → 256 → 728 (blocks 1–4), held at 728 through blocks 5–11, then 728 → 1024 → 1536 → 2048 before global pooling.
-
-White noise is added to the input during training only.
-
-### Decoder
-
-Six blocks, each `UpsamplingNearest2d(scale=2) → SeparableConv2d → BatchNorm → ReLU`, running 728 → 256 → 256 → 128 → 128 → 64 → 3. The output is bilinearly interpolated back to input resolution to give the reconstruction.
-
-### Fourier filter
-
-Applied to the 728-channel feature map from encoder block 7, not to raw pixels.
-
-1. `rfft2` per channel gives a complex spectrum of shape `[B, C, H, W/2+1]`. Only the non-redundant half is stored, since real inputs have conjugate-symmetric spectra.
-2. Real and imaginary parts are stacked along the channel axis, because PyTorch `Conv2d` is real-valued.
-3. A **grouped 1×1 convolution** (`in=2C, out=2C, groups=C`) followed by a sigmoid predicts the mask. 1×1 is deliberate: the convolution then acts independently per frequency bin `(u,v)`, mixing only the real and imaginary channels of the same feature channel. A 3×3 would mix neighbouring frequency bins, which smooths the mask rather than keeping it bin-wise and interpretable.
-4. The mask gates the spectrum by element-wise multiplication.
-5. `irfft2` returns a spatial map with certain bands emphasised or suppressed.
-
-The current implementation predicts two real masks, one each for the real and imaginary parts, and applies them separately. This is a diagonal scaling rather than a full complex multiplication, so it changes amplitude per bin without rotating phase. That was a deliberate choice: allowing phase rotation degraded performance in experiments, which is consistent with phase being the less stable of the two components.
-
-### Fusion and attention
-
-The filtered frequency map and the spatial embedding are combined by cross-modal attention, with a residual connection back to the embedding:
-
-```
-fusion = CMA(embedding, freq) + embedding
-```
-
-Guided attention then operates on the result. It takes the input, the reconstruction and the embedding:
-
-```python
-residual = |x - x̂|                          # per-pixel reconstruction error, 3 channels
-residual = interpolate(residual, embedding.shape[-2:])
-res_map  = gated(residual)                  # Conv2d(3,3,3) → ReLU → Conv2d(3,1,1) → Sigmoid
-out      = res_map * h(embedding) + dropout(embedding)
-```
-
-The gated block blends RGB reconstruction errors locally in a 3×3, then collapses them to a scalar importance per spatial location in a 1×1. `h` is a 1×1 projection with batch norm and ReLU that keeps the channel count but re-centres and rescales the features, so the multiplicative gate has predictable magnitude instead of being either toothless or overwhelming. The residual path means that when the gate zeroes a region, baseline information still reaches the classifier.
-
-### Losses
-
-Three terms are optimised jointly:
-
-- **Classification.** Cross-entropy on the binary head.
-- **Reconstruction.** Applied to the decoder output against the input face, which is what makes the residual meaningful as an attention signal.
-- **Contrastive.** Computed from normalised embedding correlations collected at several points along the encoder and decoder, pulling real-face representations together so that manipulated faces stand out as outliers.
+Two changes are made to that framework. The multi-scale graph reasoning module is removed. In its place, encoder features are transformed into the Fourier domain, modulated by a learned per-bin mask, and returned to the spatial domain before fusion with the embedding. The reasoning is that the resampling and blending traces left by forgery pipelines are expressed more directly in frequency space than in relational structure over spatial nodes.
 
 ## Results
 
-Trained on FaceForensics++ C23 and evaluated cross-dataset, so the model never saw these datasets during training. FF++ C40 appears in the table as a compression stress test, not as in-domain data.
+All models are trained on FaceForensics++ C23 and evaluated without fine-tuning. Frame-level AUROC.
 
-| Dataset | AUROC |
-|---|---|
-| WildDeepfake | 0.802 |
-| FF++ (C40) | 0.642 |
-| Average across Celeb-DF / WildDeepfake / DFDC | 0.711 |
+| Method | Celeb-DF v2 | WildDeepfake | DFDC | Mean |
+|---|---|---|---|---|
+| RECCE [1] | 0.687 | 0.643 | 0.691 | 0.674 |
+| This work | see note | 0.802 | see note | 0.711 |
 
-Cross-dataset numbers are the meaningful measure. In-domain performance on Celeb-DF v2 was high (98.1% accuracy, 0.998 AUC), but that figure largely reflects how learnable a single manipulation source is, not whether the detector generalises. The gap between the two motivated moving to a CLIP backbone in the follow-on work.
+The spectral branch gives its largest gain on WildDeepfake, which is drawn from in-the-wild footage with heterogeneous provenance and compression. This is consistent with the branch keying on resampling traces rather than on manipulation-specific texture.
 
-FF++ C40 is the weakest result, and the cause is structural: CRF 40 compression discards much of the high-frequency content the learnable filter depends on.
+Under heavy compression the picture reverses. On FF++ C40 the model reaches 0.642 AUROC, its weakest result, because CRF 40 encoding discards much of the high frequency content the filter operates on.
 
-## Setup
+In-domain performance on Celeb-DF v2 reaches 98.1% accuracy and 0.998 AUC. That number reflects how learnable a single manipulation source is and should not be read as evidence of generalization. The gap between it and the cross-dataset figures above is what motivated the follow-on work on vision-language backbones.
+
+RECCE figures are as reported in [7].
+
+<!-- TODO before publishing: fill in per-dataset Celeb-DF and DFDC AUROC in the table above.
+     The mean of 0.711 is already reported, so the individual numbers should be recoverable
+     from the evaluation logs. A table with gaps invites more doubt than a lower number would. -->
+
+## Method
+
+The full derivation is in the thesis. A summary of the two components follows.
+
+**Spectral filter.** The filter acts on the 728-channel feature map from encoder block 7, not on raw pixels. A real-input 2D FFT (`rfft2`) moves the features to frequency space, retaining the non-redundant half of the conjugate-symmetric spectrum. Because PyTorch convolutions are real-valued, real and imaginary components are stacked along the channel axis, and a grouped 1x1 convolution followed by a sigmoid predicts the mask. Grouping means each feature channel learns its own transform over its real and imaginary pair. The 1x1 kernel is deliberate: at this point a spatial location is a frequency bin, so a 1x1 acts per bin, whereas a 3x3 would mix neighbouring frequencies and smooth the mask. An inverse transform returns the filtered features to the spatial domain.
+
+The implementation predicts two real masks and applies them separately to the real and imaginary parts. This is diagonal scaling rather than full complex multiplication: it adjusts per-bin amplitude but cannot rotate phase. A full complex mask was tested and degraded cross-dataset performance, which is consistent with phase being the less stable component under compression and resampling.
+
+**Reconstruction-guided attention.** Filtered spectral features are fused with the spatial embedding by cross-modal attention with a residual connection. The absolute reconstruction residual is then passed through a small convolutional block and a sigmoid to produce a single-channel spatial attention map, which gates a projected copy of the fused features. An additive residual path preserves baseline information where the gate suppresses a region.
+
+**Training.** Classification, reconstruction and a contrastive term over normalized embedding correlations are optimized jointly, end to end. White noise is added to inputs during training only.
+
+## Requirements
+
+<!-- TODO: replace with the actual versions from your environment.
+     Run: pip freeze | grep -iE "torch|torchvision|albumentations|timm|numpy|scipy|pyyaml"
+     RECCE pins Pytorch 1.7.1, Torchvision 0.8.2, Albumentations 1.0.3, Timm 0.3.4,
+     TensorboardX 2.1, Scipy 1.5.2, PyYaml 5.3.1, which is a reasonable reference point. -->
 
 ```bash
 git clone https://github.com/snehakumari1996/Attention_Network_for_Deepfake_Detection.git
@@ -132,33 +58,74 @@ cd Attention_Network_for_Deepfake_Detection
 pip install -r requirements.txt
 ```
 
-Developed with PyTorch on a single CUDA GPU. Exact package versions are pinned in `requirements.txt`.
+## Dataset preparation
 
-## Data preparation
+Four datasets are used. Training uses FaceForensics++ C23; the others are held out for evaluation.
 
-Training uses FaceForensics++ C23. Faces are detected, cropped and aligned to the encoder's input resolution before training, with real and fake frames kept in separate directories under a train/validation split.
+- [FaceForensics++](https://github.com/ondyari/FaceForensics) [2]
+- [Celeb-DF v2](https://github.com/yuezunli/celeb-deepfakeforensics) [3]
+- [WildDeepfake](https://github.com/deepfakeinthewild/deepfake-in-the-wild) [4]
+- [DFDC](https://ai.meta.com/datasets/dfdc/) [5]
 
-Evaluation datasets (Celeb-DF v2, WildDeepfake, DFDC) are prepared the same way and used only at test time.
+The originals are video. Facial crops are extracted per frame before training, using [RetinaFace](https://github.com/biubug6/Pytorch_Retinaface) [6], and stored with authentic and manipulated frames in separate directories.
+
+<!-- TODO: state the extracted crop resolution and frames sampled per video. -->
 
 ## Training
 
-Training runs end to end: the classification, reconstruction and contrastive terms are optimised together rather than in stages. White noise is added to inputs during training only, as a regulariser against the model keying on clean-image statistics.
+<!-- TODO: replace with the exact command this repository uses. -->
 
-Hyperparameters live in the config file in this repository.
+```bash
+python train.py --config config/default.yaml
+```
 
-## Evaluation
+Training parameters are set in the config file: batch size, learning rate, optimizer, schedule, and the weights on the reconstruction and contrastive terms.
 
-Evaluation reports frame-level AUROC on each test dataset. Because the point of the model is cross-dataset behaviour, in-domain FF++ numbers are reported for reference only.
+## Testing
 
-Pretrained weights are available on request.
+<!-- TODO: replace with the exact command this repository uses. -->
+
+```bash
+python test.py --config config/default.yaml
+```
+
+Reports frame-level AUROC on the configured evaluation set.
+
+## Pretrained weights
+
+Available on request.
 
 ## Limitations
 
-- Trained on a single manipulation source, so performance drops on unseen generators.
-- Heavy compression attenuates the bands the Fourier filter relies on, visible in the FF++ C40 result.
-- The filter applies diagonal scaling rather than full complex multiplication, so it cannot adjust phase. Phase rotation was tested and degraded results, but a magnitude–phase parameterisation with a bounded gain remains untested.
-- Predates diffusion-based face generation; not evaluated on diffusion-generated content.
-- No evaluation across demographic groups. The benchmarks lack annotations for skin tone, gender and age, so any disparity in error rates is unmeasured.
+Training uses a single manipulation source, so performance degrades on unseen generators.
+
+Heavy compression attenuates the bands the spectral filter operates on, which is visible in the FF++ C40 result.
+
+The filter applies diagonal scaling rather than full complex multiplication and cannot adjust phase. A magnitude and phase parameterization with bounded gain remains untested.
+
+The method predates diffusion-based face synthesis and has not been evaluated on diffusion-generated content.
+
+No disaggregated evaluation across demographic groups was carried out. The benchmarks used lack annotations for skin tone, gender and age, so differences in error rates across groups are unmeasured, and faces with atypical appearance may be misclassified at higher rates.
+
+## References
+
+[1] J. Cao, C. Ma, T. Yao, S. Chen, S. Ding, X. Yang. End-to-End Reconstruction-Classification Learning for Face Forgery Detection. CVPR 2022. [code](https://github.com/VISION-SJTU/RECCE)
+
+[2] A. Rossler, D. Cozzolino, L. Verdoliva, C. Riess, J. Thies, M. Niessner. FaceForensics++: Learning to Detect Manipulated Facial Images. ICCV 2019.
+
+[3] Y. Li, X. Yang, P. Sun, H. Qi, S. Lyu. Celeb-DF: A Large-Scale Challenging Dataset for DeepFake Forensics. CVPR 2020.
+
+[4] B. Zi, M. Chang, J. Chen, X. Ma, Y. Jiang. WildDeepfake: A Challenging Real-World Dataset for Deepfake Detection. ACM Multimedia 2020.
+
+[5] B. Dolhansky, J. Bitton, B. Pflaum, J. Lu, R. Howes, M. Wang, C. Canton-Ferrer. The DeepFake Detection Challenge Dataset. arXiv:2006.07397, 2020.
+
+[6] J. Deng, J. Guo, E. Ververas, I. Kotsia, S. Zafeiriou. RetinaFace: Single-Shot Multi-Level Face Localisation in the Wild. CVPR 2020.
+
+[7] Reported cross-dataset figures for RECCE are taken from the comparison table in arXiv:2411.05335.
+
+## Acknowledgement
+
+The reconstruction-classification backbone is based on the official RECCE implementation [1].
 
 ## Citation
 
@@ -173,4 +140,4 @@ Pretrained weights are available on request.
 
 ## Contact
 
-Sneha Kumari — sneha.k.1996@gmail.com
+Sneha Kumari, sneha.k.1996@gmail.com
